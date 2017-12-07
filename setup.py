@@ -26,6 +26,7 @@ install_requires = [
     # TODO: unpin once they support wheel building again
     'scrapyd==1.1.0',
     'scrapyd-client>=1.0.1',
+    'sickle>=0.6.2',
     'six>=1.9.0',
     'requests>=2.8.1',
     'celery>=3.1.23',

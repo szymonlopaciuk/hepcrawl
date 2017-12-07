@@ -78,6 +78,13 @@ DOWNLOADER_MIDDLEWARES = {
     'hepcrawl.middlewares.HepcrawlCrawlOnceMiddleware': 100,
 }
 
+# Configure custom downloaders
+# https://doc.scrapy.org/en/0.20/topics/settings.html#download-handlers
+DOWNLOAD_HANDLERS = {
+    'oaipmh+http': 'hepcrawl.downloaders.DummyDownloadHandler',
+    'oaipmh+https': 'hepcrawl.downloaders.DummyDownloadHandler',
+}
+
 CRAWL_ONCE_ENABLED = True
 CRAWL_ONCE_DEFAULT = True
 CRAWL_ONCE_PATH = os.environ.get(
