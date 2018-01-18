@@ -19,6 +19,7 @@ from inspire_schemas.api import LiteratureBuilder, ReferenceBuilder
 from inspire_schemas.utils import split_page_artid
 from inspire_utils.date import PartialDate
 from inspire_utils.helpers import maybe_int, remove_tags
+from inspire_utils.record import get_value
 
 from ..utils import get_first, get_node
 
@@ -75,7 +76,7 @@ class JatsParser(object):
             List[dict]: an array of reference schema records, representing
                 the references in the record
         """
-        ref_nodes = self.root.xpath('./back/ref-list/ref')
+        ref_nodes = self.root.xpath('./back/ref-list//ref')
         return [self.get_reference(node) for node in ref_nodes]
 
     remove_tags_config_abstract = {
@@ -359,11 +360,12 @@ class JatsParser(object):
             not_online=not_online
         )
 
-        year = min(
-            self.get_date(date_node) for date_node in date_nodes
-        ).year
-
-        return year
+        try:
+            return min(
+                self.get_date(date_node) for date_node in date_nodes
+            ).year
+        except ValueError:
+            return None
 
     def get_author_affiliations(self, author_node):
         """Extract an author's affiliations."""
@@ -485,12 +487,27 @@ class JatsParser(object):
             role(str): author role
 
         Returns:
-            List[str]: list of names
+            Iterable[str]: list of names
         """
-        return ref_node.xpath(
+        string_name = ref_node.xpath(
             './person-group[@person-group-type=$role]/string-name/text()',
             role=role
         ).extract()
+
+        if string_name:
+            return string_name
+
+        name_nodes = ref_node.xpath(
+            './person-group[@person-group-type=$role]/name',
+            role=role
+        )
+
+        return (
+            u'{}, {}'.format(
+                name_node.xpath('./surname/text()').extract_first(),
+                name_node.xpath('./given-names/text()').extract_first()
+            ) for name_node in name_nodes
+        )
 
 
     def get_reference(self, ref_node):
@@ -528,11 +545,13 @@ class JatsParser(object):
                 builder.add_parent_title,
             ),
             ('./publisher-name/text()', builder.set_publisher),
+            ('./publisher-loc/text()', builder.set_imprint_place),
             ('./volume/text()', builder.set_journal_volume),
             ('./issue/text()', builder.set_journal_issue),
             ('./year/text()', builder.set_year),
             ('./pub-id[@pub-id-type="arxiv"]/text()', builder.add_uid),
             ('./pub-id[@pub-id-type="doi"]/text()', builder.add_uid),
+            ('./ext-link[contains(@href, "arxiv.org")]/text()', builder.add_uid),
             ('./article-title/text()', builder.add_title),
             ('../label/text()', lambda x: builder.set_label(x.strip('[].')))
         ]
@@ -542,13 +561,22 @@ class JatsParser(object):
             if value:
                 field_handler(value)
 
+        if get_value(builder.obj, 'reference.imprint'):
+            # Assume reference year refers to the imprint
+            # if other imprint information was provided
+            builder.set_imprint_date(
+                citation_node.xpath('./year/text()').extract_first()
+            )
+
         for editor in self.get_reference_authors(citation_node, 'editor'):
             builder.add_author(editor, 'editor')
 
         for author in self.get_reference_authors(citation_node, 'author'):
             builder.add_author(author, 'author')
 
-        page_range = citation_node.xpath('./page-range/text()').extract_first()
+        page_range = citation_node.xpath(
+            './page-range/text()|./fpage/text()'
+        ).extract_first()
         if page_range:
             page_artid = split_page_artid(page_range)
             builder.set_page_artid(*page_artid)
