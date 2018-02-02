@@ -20,7 +20,7 @@ from scrapy import Request
 from scrapy.spiders import XMLFeedSpider
 
 from . import StatefulSpider
-from ..extractors.jats import Jats
+from ..parsers.jats import JatsParser
 from ..items import HEPRecord
 from ..loaders import HEPLoader
 from ..utils import (
@@ -28,7 +28,6 @@ from ..utils import (
     ftp_connection_info,
     get_first,
     get_journal_and_section,
-    get_licenses,
     get_node,
     parse_domain,
     ParsedItem,
@@ -36,7 +35,7 @@ from ..utils import (
 )
 
 
-class EDPSpider(StatefulSpider, Jats, XMLFeedSpider):
+class EDPSpider(StatefulSpider, XMLFeedSpider):
     """EDP Sciences crawler.
 
     This spider connects to a given FTP hosts and downloads zip files with
@@ -333,74 +332,20 @@ class EDPSpider(StatefulSpider, Jats, XMLFeedSpider):
     def build_item_jats(self, response):
         """Build the final HEPRecord with JATS-format XML ('jp')."""
         node = get_node(response.meta["record"])
-        article_type = response.meta.get("article_type")
 
-        record = HEPLoader(item=HEPRecord(), selector=node, response=response)
-        if article_type in ['correction',
-                            'addendum']:
-            record.add_xpath('related_article_doi',
-                             './/related-article[@ext-link-type="doi"]/@href')
-            record.add_value('journal_doctype', article_type)
+        parser = JatsParser(node, source="EDP")
 
-        record.add_dois(dois_values=response.meta.get("dois"))
-        record.add_xpath('page_nr', ".//counts/page-count/@count")
-        record.add_xpath('abstract', './/abstract[1]')
-        record.add_xpath('title', './/article-title/text()')
-        record.add_xpath('subtitle', './/subtitle/text()')
-        record.add_value('authors', self._get_authors_jats(node))
-        record.add_xpath('collaborations', ".//contrib/collab/text()")
-
-        free_keywords, classification_numbers = self._get_keywords(node)
-        record.add_value('free_keywords', free_keywords)
-        record.add_value('classification_numbers', classification_numbers)
-
-        record.add_value('journal_title', response.meta['journal_title'])
-        record.add_xpath('journal_issue', './/front//issue/text()')
-        record.add_xpath('journal_volume', './/front//volume/text()')
-        record.add_xpath('journal_artid', './/elocation-id/text()')
-
-        fpage = node.xpath('.//front//fpage/text()').extract()
-        lpage = node.xpath('.//front//lpage/text()').extract()
-        record.add_value('journal_fpage', fpage)
-        record.add_value('journal_lpage', lpage)
-
-        date_published = response.meta['date_published']
-        record.add_value('journal_year', int(date_published[:4]))
-        record.add_value('date_published', date_published)
-
-        record.add_xpath('copyright_holder', './/copyright-holder/text()')
-        record.add_xpath('copyright_year', './/copyright-year/text()')
-        record.add_xpath('copyright_statement',
-                         './/copyright-statement/text()')
-        record.add_value('copyright_material', 'Article')
-
-        license = get_licenses(
-            license_url=node.xpath(
-                './/license/license-p/ext-link/@href'
-            ).extract_first()
-        )
-        record.add_value('license', license)
-
-        record.add_value('collections', self._get_collections(
-            node, article_type, response.meta['journal_title']))
-
-        if "pdf_links" in response.meta:
-            record.add_value(
-                "documents",
-                self._create_file(
-                    get_first(response.meta["pdf_links"]),
-                    "INSPIRE-PUBLIC",
-                    "Fulltext"
-                )
+        for pdf_link in response.meta.get('pdf_links', []):
+            parser.builder.add_document(
+                key=os.path.basename(pdf_link),
+                url=pdf_link,
+                fulltext=True,
+                hidden=False,
             )
-        record.add_value("urls", response.meta.get("urls"))
-
-        references = self._get_references(node)
-        record.add_value("references", references)
 
         parsed_item = ParsedItem(
-            record=record.load_item(),
-            record_format='hepcrawl',
+            record=parser.parse(),
+            record_format='hep',
         )
 
         return parsed_item
