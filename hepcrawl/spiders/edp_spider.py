@@ -16,6 +16,8 @@ import urlparse
 import tarfile
 from tempfile import mkdtemp
 
+from inspire_schemas.builders import LiteratureBuilder
+from inspire_utils.record import get_value
 from scrapy import Request
 from scrapy.spiders import XMLFeedSpider
 
@@ -27,7 +29,6 @@ from ..utils import (
     ftp_list_files,
     ftp_connection_info,
     get_first,
-    get_journal_and_section,
     get_node,
     parse_domain,
     ParsedItem,
@@ -218,79 +219,91 @@ class EDPSpider(StatefulSpider, XMLFeedSpider):
     def parse_node(self, response, node):
         """Parse the XML file and yield a request to scrape for the PDF."""
         node.remove_namespaces()
+        # Deal with open access restrictions and allowed article types
         if response.meta.get("rich"):
-            article_type = node.xpath('./ArticleID/@Type').extract_first()
-            dois = node.xpath('.//DOI/text()').extract()
-            date_published = self._get_date_published_rich(node)
-            journal_title = node.xpath(
-                './/JournalShortTitle/text()|//JournalTitle/text()').extract_first()
+            item = self.build_item_rich(response, node)
+            dois = item.record.get('dois', [])
+            doi = dois[0] if len(dois) else None
+            journal_title = item.record.get('journal_title')
         else:
-            article_type = node.xpath('@article-type').extract_first()
-            dois = node.xpath(
-                './/article-id[@pub-id-type="doi"]/text()').extract()
-            date_published = self._get_published_date(node)
-            journal_title = node.xpath(
-                './/abbrev-journal-title/text()|//journal-title/text()').extract_first()
+            # import pdb
+            # pdb.set_trace()
+            item = self.build_item_jats(response, node)
+            doi = get_value(item.record, 'dois.value[0]')
+            journal_title = get_value(item.record, 'publication_info.journal_title[0]')
 
-        self.logger.info("Got article_type {0}".format(article_type))
-        if article_type is None or article_type not in self.allowed_article_types:
-            # Filter out non-interesting article types
-            return None
-
-        if dois and journal_title in self.OPEN_ACCESS_JOURNALS:
-            # We should get the pdf only for open access journals
-            link = "http://dx.doi.org/" + dois[0]
-            request = Request(link, callback=self.scrape_for_pdf)
-            request.meta["record"] = node.extract()
-            request.meta["article_type"] = article_type
-            request.meta["dois"] = dois
-            request.meta["rich"] = response.meta.get("rich")
-            request.meta["date_published"] = date_published
-            request.meta["journal_title"] = journal_title
-            return request
+        if doi and journal_title in self.OPEN_ACCESS_JOURNALS:
+            return Request(
+                "http://dx.doi.org/" + doi,
+                callback=self.scrape_for_pdf,
+                meta={'parsed_item': item}
+            )
         else:
-            response.meta["record"] = node.extract()
-            response.meta["article_type"] = article_type
-            response.meta["dois"] = dois
-            response.meta["date_published"] = date_published
-            response.meta["journal_title"] = journal_title
-            if response.meta.get("rich"):
-                return self.build_item_rich(response)
-            else:
-                return self.build_item_jats(response)
+            return item
 
     def scrape_for_pdf(self, response):
         """Try to find the fulltext pdf from the web page."""
-        pdf_links = []
+        parsed_item = response.meta["parsed_item"]
+
         all_links = response.xpath(
-            '//a[contains(@href, "pdf")]/@href').extract()
+            '//a[contains(@href, "pdf")]/@href'
+        ).extract()
         domain = parse_domain(response.url)
-        pdf_links = sorted(list(set(
-            [urlparse.urljoin(domain, link) for link in all_links])))
+        pdf_links = sorted(set(
+            [urlparse.urljoin(domain, link) for link in all_links]
+        ))
 
-        response.meta["pdf_links"] = pdf_links
-        response.meta["urls"] = [response.url]
-        if response.meta.get("rich"):
-            return self.build_item_rich(response)
-            # NOTE: actually this might not be desirable
-            # as publications with this format are not open access
-        else:
-            return self.build_item_jats(response)
+        self._attach_pdfs(parsed_item, pdf_links)
+        self._attach_url(parsed_item, response.url)
+        return parsed_item
 
-    def build_item_rich(self, response):
+    @classmethod
+    def _attach_pdfs(self, item, pdf_urls):
+        if item.record_format == 'hep':
+            builder = LiteratureBuilder(record=item.record, source=self.source)
+
+            for pdf_url in pdf_urls:
+                builder.add_document(
+                    key=os.path.basename(pdf_url),
+                    url=pdf_url,
+                    fulltext=True,
+                    hidden=False,
+                )
+        elif item.record_format == 'hepcrawl':
+            # NOTE: maybe this should be removed as the 'rich' format records
+            # are not open access.
+            item.record.add_value(
+                "documents",
+                self._create_file(
+                    get_first(pdf_urls or []),
+                    "INSPIRE-PUBLIC",
+                    "Fulltext",
+                    "pdf",
+                )
+            )
+
+    @classmethod
+    def _attach_url(self, item, url):
+        if item.record_format == 'hep':
+            builder = LiteratureBuilder(record=item.record, source=self.source)
+            builder.add_url(url)
+        elif item.record_format == 'hepcrawl':
+            item.record.add_value("urls", [url])
+
+    def build_item_rich(self, response, node):
         """Build the final HEPRecord with "rich" format XML."""
-        node = get_node(response.meta["record"])
         article_type = response.meta.get("article_type")
         record = HEPLoader(item=HEPRecord(), selector=node, response=response)
 
-        record.add_dois(dois_values=response.meta.get("dois"))
+        record.add_xpath('dois', './/DOI/text()')
         record.add_xpath('abstract', './/Abstract')
         record.add_xpath('title', './/ArticleTitle/Title')
         record.add_xpath('subtitle', './/ArticleTitle/Subtitle')
         record.add_value('authors', self._get_authors_rich(node))
         record.add_xpath('free_keywords', './/Subject/Keyword/text()')
 
-        record.add_value('journal_title', response.meta['journal_title'])
+        journal_title = node.xpath('.//JournalShortTitle/text()|//JournalTitle/text()').extract_first()
+        record.add_value('journal_title', journal_title)
         record.add_xpath('journal_issue', './/Issue/text()')
         record.add_xpath('journal_volume', './/Volume/text()')
         fpage = node.xpath('.//FirstPage/text()').extract_first()
@@ -303,24 +316,11 @@ class EDPSpider(StatefulSpider, XMLFeedSpider):
         journal_year = node.xpath('.//IssueID/Year/text()').extract()
         if journal_year:
             record.add_value('journal_year', int(journal_year[0]))
-        record.add_value('date_published', response.meta['date_published'])
+        record.add_value('date_published', self._get_date_published_rich(node))
 
         record.add_xpath('copyright_holder', './/Copyright/text()')
         record.add_value('collections', self._get_collections(
-            node, article_type, response.meta['journal_title']))
-
-        if "pdf_links" in response.meta:
-            # NOTE: maybe this should be removed as the 'rich' format records
-            # are not open access.
-            record.add_value(
-                "documents",
-                self._create_file(
-                    get_first(response.meta["pdf_links"]),
-                    "INSPIRE-PUBLIC",
-                    "Fulltext"
-                )
-            )
-        record.add_value("urls", response.meta.get("urls"))
+            node, article_type, journal_title))
 
         parsed_item = ParsedItem(
             record=record.load_item(),
@@ -329,19 +329,9 @@ class EDPSpider(StatefulSpider, XMLFeedSpider):
 
         return parsed_item
 
-    def build_item_jats(self, response):
+    def build_item_jats(self, response, node):
         """Build the final HEPRecord with JATS-format XML ('jp')."""
-        node = get_node(response.meta["record"])
-
         parser = JatsParser(node, source="EDP")
-
-        for pdf_link in response.meta.get('pdf_links', []):
-            parser.builder.add_document(
-                key=os.path.basename(pdf_link),
-                url=pdf_link,
-                fulltext=True,
-                hidden=False,
-            )
 
         parsed_item = ParsedItem(
             record=parser.parse(),
@@ -349,114 +339,6 @@ class EDPSpider(StatefulSpider, XMLFeedSpider):
         )
 
         return parsed_item
-
-    def _get_references(self, node):
-        """Get the references."""
-        # NOTE: this is *almost* the same as in APS spider or JATS extractor
-        references = []
-        ref_list = node.xpath("//ref-list//ref")
-        references = []
-
-        for reference in ref_list:
-            label = reference.xpath("./label/text()").extract_first()
-            if label:
-                label = label.strip("[].")
-            inner_refs = reference.xpath(".//mixed-citation")
-            if not inner_refs:
-                references.append(self._parse_reference(reference, label))  # FIXME: test missing, we might be testing this in APS
-            for in_ref in inner_refs:
-                references.append(self._parse_reference(in_ref, label))
-
-        return references
-
-    def _parse_reference(self, ref, label):
-        """Parse a reference."""
-        reference = {}
-        # FIXME: get only raw references?
-        raw_reference = ref.extract()
-
-        sublabel = ref.xpath("./@id").extract_first()
-        if label:
-            # If multiple references under one label:
-            if sublabel:
-                sublabel = sublabel[-1]
-                label = label + sublabel
-        reference['number'] = label  # NOTE: this should not be int
-
-        ref_type = ref.xpath("./@publication-type").extract_first()
-        doi, urls = self._get_external_links(ref)
-        collaboration = ref.xpath(".//collab/text()").extract_first()
-
-        # FIXME: do we want authors be a string or a list of raw author names?
-        # In Elsevier spider it's a specially formatted string.
-        # Here it's just a list.
-        authors = []
-        authors_raw = ref.xpath('.//string-name')
-        for author_group in authors_raw:
-            surname = author_group.xpath('.//surname/text()').extract_first()
-            firstnames = author_group.xpath('.//given-names/text()').extract_first()
-            authors.append(surname + ", " + firstnames)
-
-        title = ref.xpath(".//article-title/text()").extract_first()
-        publication = ref.xpath(".//source/text()").extract_first()
-        fpage = ref.xpath(".//fpage/text()").extract_first()
-        issue = ref.xpath(".//issue/text()").extract_first()
-        volume = ref.xpath(".//volume/text()").extract_first()
-        year = ref.xpath(".//year/text()").extract_first()
-        publisher = ref.xpath('.//publisher-name/text()').extract_first()
-        publisher_loc = ref.xpath(
-            './/publisher-loc/text()').extract_first()
-        if not publisher_loc:
-            publisher_loc = ref.xpath('.//publisher-name/following-sibling::text()[1]').extract_first()
-        if publisher and publisher_loc:
-            publisher = publisher_loc.strip(",. ") + ': ' + publisher
-
-        # Construct the reference dict
-        journal_title = ''
-        if publication:
-            journal_title, section = get_journal_and_section(publication)
-            if journal_title:
-                reference['journal_title'] = journal_title
-                if volume:
-                    volume = section + volume
-                    reference['journal_volume'] = volume
-        if ref_type:
-            reference['doctype'] = ref_type
-        if urls:
-            reference['url'] = urls
-        if doi:
-            reference['doi'] = doi
-        if fpage:
-            reference['fpage'] = fpage
-        if title:
-            reference['title'] = title
-        if issue:
-            reference['issue'] = issue
-        if year:
-            reference['year'] = year
-        if authors:
-            reference['authors'] = authors
-        if collaboration:
-            reference['collaboration'] = collaboration
-        if publisher:
-            reference['publisher'] = publisher
-        if raw_reference:
-            reference['raw_reference'] = raw_reference
-
-        return reference
-
-    def _get_external_links(self, ref):
-        """Get and format DOI and other external links."""
-        ext_links = ref.xpath('.//ext-link/@href').extract()
-        doi = ""
-        urls = []
-        for ext_link in ext_links:
-            if "doi" in ext_link:
-                doi = "doi:" + ext_link.replace("http://dx.doi.org/", "")
-            else:
-                urls.append(ext_link)
-
-        return doi, urls
 
     def _get_date_published_rich(self, node):
         """Get published date."""
@@ -478,54 +360,6 @@ class EDPSpider(StatefulSpider, XMLFeedSpider):
             return ['HEP', 'Review']
         else:
             return ['HEP', 'Published']
-
-    def _get_authors_jats(self, node):
-        """Get authors and return formatted dictionary.
-
-        Note that the `get_authors` in JATS extractor doesn't work here.
-        """
-        authors = []
-        for contrib in node.xpath('.//contrib[@contrib-type="author"]'):
-            surname = contrib.xpath('name/surname/text()').extract()
-            given_names = contrib.xpath('name/given-names/text()').extract()
-            email = contrib.xpath('email/text()').extract_first()
-
-            affs_raw = contrib.xpath('aff')
-            affiliations = []
-            reffered_id = contrib.xpath('xref[@ref-type="aff"]/@rid').extract()
-            if reffered_id:
-                aff = node.xpath('.//aff[@id="{0}"]/addr-line/institution/text()'.format(
-                    get_first(reffered_id))).extract()
-                if not aff:
-                    aff = node.xpath('.//aff[@id="{0}"]/addr-line/text()'.format(
-                        get_first(reffered_id))).extract()
-                affs_raw += aff
-            if affs_raw:
-                affs_raw_no_email = []
-                for aff_raw in affs_raw:
-                    # Take e-mail from affiliation string
-                    # FIXME: There is only one affiliation and email line per
-                    # institution. The result is that every author will receive
-                    # the email of the contact person as their own.
-                    # There might also be a list of emails of all the authors.
-                    if "e-mail" in aff_raw:
-                        split_aff = aff_raw.split("e-mail")
-                        affs_raw_no_email.append(split_aff[0].strip())
-                        # FIXME: solution: strip the email but don't add it
-                        # to 'email' key?
-                        # if not email:  # uncomment if you want to add it after all
-                        #    email = [split_aff[1].strip(": \n")]
-                if affs_raw_no_email:
-                    affs_raw = affs_raw_no_email
-                affiliations = [{'value': aff} for aff in affs_raw]
-            authors.append({
-                'surname': get_first(surname, ""),
-                'given_names': get_first(given_names, ""),
-                'affiliations': affiliations,
-                'email': email,
-            })
-
-        return authors
 
     def _get_authors_rich(self, node):
         """Get authors and return formatted dictionary."""
